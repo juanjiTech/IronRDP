@@ -94,6 +94,8 @@ struct SessionBuilderInner {
     enable_server_pointer: bool,
     legacy_graphics: bool,
     outbound_message_size_limit: Option<usize>,
+    /// RDP CS_CORE DesktopScaleFactor (percent). 0 = omit / server default; else 100..=500.
+    desktop_scale_factor: u32,
 }
 
 impl Default for SessionBuilderInner {
@@ -138,6 +140,7 @@ impl Default for SessionBuilderInner {
             enable_server_pointer: true,
             legacy_graphics: false,
             outbound_message_size_limit: None,
+            desktop_scale_factor: 0,
         }
     }
 }
@@ -257,6 +260,20 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
             |enable_server_pointer: bool| { self.0.borrow_mut().enable_server_pointer = enable_server_pointer };
             |legacy_graphics: bool| { self.0.borrow_mut().legacy_graphics = legacy_graphics };
+            |desktop_scale_factor: f64| {
+                let scale = if desktop_scale_factor == 0.0 {
+                    0
+                } else if (100.0..=500.0).contains(&desktop_scale_factor) {
+                    #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    {
+                        desktop_scale_factor as u32
+                    }
+                } else {
+                    warn!(desktop_scale_factor, "Invalid desktop_scale_factor; fallback to 0 (server default)");
+                    0
+                };
+                self.0.borrow_mut().desktop_scale_factor = scale;
+            };
             |outbound_message_size_limit: f64| {
                 let limit = if outbound_message_size_limit >= 0.0 && outbound_message_size_limit <= f64::from(u32::MAX) {
                     #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -364,6 +381,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_driver_name,
             outbound_message_size_limit,
             legacy_graphics,
+            desktop_scale_factor,
         );
 
         {
@@ -407,6 +425,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_driver_name = inner.printer_driver_name.clone();
             outbound_message_size_limit = inner.outbound_message_size_limit;
             legacy_graphics = inner.legacy_graphics;
+            desktop_scale_factor = inner.desktop_scale_factor;
         }
 
         if pcb.is_some() && vmconnect.is_some() {
@@ -422,6 +441,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             client_name.clone(),
             desktop_size,
             legacy_graphics,
+            desktop_scale_factor,
         );
 
         let enable_credssp = self.0.borrow().enable_credssp;
@@ -1459,6 +1479,7 @@ fn build_config(
     client_name: String,
     desktop_size: DesktopSize,
     legacy_graphics: bool,
+    desktop_scale_factor: u32,
 ) -> connector::Config {
     // Win7-class servers need 32-bpp lossless bitmaps and no advertised codecs.
     let bitmap = if legacy_graphics {
@@ -1518,7 +1539,7 @@ fn build_config(
         multitransport_flags: None,
         support_dyn_vc_gfx_protocol: false,
         performance_flags: PerformanceFlags::default(),
-        desktop_scale_factor: 0,
+        desktop_scale_factor,
         hardware_id: None,
         license_cache: None,
         timezone_info: TimezoneInfo::default(),

@@ -65,6 +65,15 @@ export function legacyGraphics(enable: boolean): Extension {
     return new Extension('legacy_graphics', enable);
 }
 
+/**
+ * RDP CS_CORE DesktopScaleFactor (percent). Tell Windows to scale UI chrome/fonts.
+ * Valid range 100..=500; use `Math.round(devicePixelRatio * 100)` with a HiDPI framebuffer.
+ * Pass 0 to leave the server default.
+ */
+export function desktopScaleFactor(percent: number): Extension {
+    return new Extension('desktop_scale_factor', percent);
+}
+
 // --- File transfer (RDP-specific) ---
 
 export { RdpFileTransferProvider } from './RdpFileTransferProvider';
