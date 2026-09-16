@@ -149,6 +149,27 @@ export class RemoteDesktopService {
         this.doTransactionFromDeviceEvents(releases);
     }
 
+    /**
+     * Send a single key by browser `KeyboardEvent.code` (e.g. ControlLeft, Tab).
+     * `down === undefined` sends press+release; otherwise sticky press/release.
+     */
+    sendKeyByCode(code: string, down?: boolean) {
+        const scancode = scanCode(code);
+        if (Number.isNaN(scancode)) {
+            console.warn(`Unknown key code for RDP: ${code}`);
+            return;
+        }
+        if (down === undefined) {
+            this.doTransactionFromDeviceEvents([
+                this.module.DeviceEvent.keyPressed(scancode),
+                this.module.DeviceEvent.keyReleased(scancode),
+            ]);
+            return;
+        }
+        const evt = down ? this.module.DeviceEvent.keyPressed(scancode) : this.module.DeviceEvent.keyReleased(scancode);
+        this.doTransactionFromDeviceEvents([evt]);
+    }
+
     focusLost() {
         this.releaseAllInputs();
     }
