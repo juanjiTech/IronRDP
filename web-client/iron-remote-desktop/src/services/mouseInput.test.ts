@@ -11,15 +11,16 @@ import type { Session } from '../interfaces/Session';
  * cursor off the canvas before releasing.  Two defects contributed:
  *
  *   Defect 1 (iron-remote-desktop.svelte): onmouseleave sent a spurious
- *     mouseButtonReleased for a hardcoded button index instead of calling
- *     releaseAllInputs — fixed in the component.
+ *     mouseButtonReleased for a hardcoded button index instead of releasing
+ *     every button — fixed in the component.
  *
  *   Defect 2 (remote-desktop.service.ts): mouseIn() did not reconcile the
  *     browser's event.buttons bitmask against the RDP session's assumed
  *     button state, so re-entering the canvas left stale "button held"
  *     state on the server — fixed by the mouseIn() implementation tested here.
  *
- * These tests also cover the mouseOut() path which must call releaseAllInputs.
+ * These tests also cover the mouseOut() path, which releases the mouse buttons
+ * only: keyboard state has to survive the pointer leaving the canvas.
  */
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -67,17 +68,29 @@ function createMockSession(): Session {
 describe('mouseOut', () => {
     let service: RemoteDesktopService;
     let session: Session;
+    let module: RemoteDesktopModule;
 
     beforeEach(() => {
         vi.clearAllMocks();
-        service = new RemoteDesktopService(createMockModule());
+        module = createMockModule();
+        service = new RemoteDesktopService(module);
         session = createMockSession();
         service.session = session;
     });
 
-    it('calls releaseAllInputs on the session', () => {
+    it('releases every mouse button', () => {
         service.mouseOut(new MouseEvent('mouseleave'));
-        expect(session.releaseAllInputs).toHaveBeenCalledTimes(1);
+
+        expect(session.applyInputs).toHaveBeenCalledTimes(1);
+        const releasedButtons = vi.mocked(module.DeviceEvent.mouseButtonReleased).mock.calls.map(([id]) => id);
+        expect(releasedButtons).toEqual([0, 1, 2]);
+    });
+
+    it('leaves keyboard state alone so sticky modifiers survive an overlay hover', () => {
+        service.mouseOut(new MouseEvent('mouseleave'));
+
+        expect(session.releaseAllInputs).not.toHaveBeenCalled();
+        expect(module.DeviceEvent.keyReleased).not.toHaveBeenCalled();
     });
 
     it('does not throw when there is no active session', () => {

@@ -135,7 +135,18 @@ export class RemoteDesktopService {
     }
 
     mouseOut(_event: MouseEvent) {
-        this.releaseAllInputs();
+        // Only clear mouse buttons here. Releasing keyboard too would kill sticky
+        // modifiers the host UI holds while the pointer is on an overlay toolbar.
+        this.releaseMouseButtons();
+    }
+
+    /** Release buttons the session may still think are down (pointer left the canvas). */
+    private releaseMouseButtons() {
+        if (!this.session) return;
+        // Force-release left/middle/right unconditionally: unlike `mouseIn`, there is no
+        // reliable `event.buttons` to diff against once the pointer has left.
+        const releases = [0, 1, 2].map((buttonId) => this.module.DeviceEvent.mouseButtonReleased(buttonId));
+        this.doTransactionFromDeviceEvents(releases);
     }
 
     focusLost() {
