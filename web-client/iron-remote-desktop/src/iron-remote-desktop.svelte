@@ -344,6 +344,9 @@
         loggingService.verbose = verbose === 'true';
         loggingService.info('Dom ready');
         await initcanvas();
+        // Yield after `ready` so hosts (e.g. Termium) can setEnableAutoClipboard(false)
+        // before initClipboard reads autoClipboard / touches Permissions API.
+        await new Promise<void>((r) => setTimeout(r, 0));
         await clipboardService.initClipboard();
     });
 

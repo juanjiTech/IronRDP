@@ -25,6 +25,12 @@ export interface UserInteraction {
 
     ctrlV(): void;
 
+    /**
+     * Send a key by browser `KeyboardEvent.code` (e.g. `ControlLeft`, `Tab`).
+     * Omit `down` for a press+release; pass true/false for sticky modifiers.
+     */
+    sendKey(code: string, down?: boolean): void;
+
     shutdown(): void;
 
     setCursorStyleOverride(style: string | null): void;
