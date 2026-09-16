@@ -23,6 +23,7 @@ use ironrdp::connector::{self, ClientConnector, Credentials};
 use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::dvc::DrdynvcClient;
 use ironrdp::graphics::image_processing::PixelFormat;
+use ironrdp::pdu::geometry::InclusiveRectangle;
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp::pdu::rdp::capability_sets::{BitmapCodecs, client_codecs_capabilities};
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
@@ -32,6 +33,7 @@ use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
 use ironrdp_core::WriteBuf;
+use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
 use ironrdp_futures::{FramedWrite, single_sequence_step_read};
 use rgb::AsPixels as _;
 use tap::prelude::*;
@@ -71,6 +73,7 @@ struct SessionBuilderInner {
     render_canvas: Option<HtmlCanvasElement>,
     set_cursor_style_callback: Option<js_sys::Function>,
     set_cursor_style_callback_context: Option<JsValue>,
+    canvas_resized_callback: Option<js_sys::Function>,
     remote_clipboard_changed_callback: Option<js_sys::Function>,
     force_clipboard_update_callback: Option<js_sys::Function>,
     // File transfer callbacks
@@ -94,6 +97,8 @@ struct SessionBuilderInner {
     enable_server_pointer: bool,
     legacy_graphics: bool,
     outbound_message_size_limit: Option<usize>,
+    /// RDP CS_CORE DesktopScaleFactor (percent). 0 = omit / server default; else 100..=500.
+    desktop_scale_factor: u32,
 }
 
 impl Default for SessionBuilderInner {
@@ -117,6 +122,7 @@ impl Default for SessionBuilderInner {
             render_canvas: None,
             set_cursor_style_callback: None,
             set_cursor_style_callback_context: None,
+            canvas_resized_callback: None,
             remote_clipboard_changed_callback: None,
             force_clipboard_update_callback: None,
             files_available_callback: None,
@@ -138,6 +144,7 @@ impl Default for SessionBuilderInner {
             enable_server_pointer: true,
             legacy_graphics: false,
             outbound_message_size_limit: None,
+            desktop_scale_factor: 0,
         }
     }
 }
@@ -242,8 +249,9 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         self.clone()
     }
 
-    /// Because the server does not resize the framebuffer in the RDP protocol, this feature is unused in IronRDP.
-    fn canvas_resized_callback(&self, _callback: js_sys::Function) -> Self {
+    /// Called after the HTML canvas backing store is resized (Display Control / reactivation).
+    fn canvas_resized_callback(&self, callback: js_sys::Function) -> Self {
+        self.0.borrow_mut().canvas_resized_callback = Some(callback);
         self.clone()
     }
 
@@ -257,6 +265,20 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
             |enable_server_pointer: bool| { self.0.borrow_mut().enable_server_pointer = enable_server_pointer };
             |legacy_graphics: bool| { self.0.borrow_mut().legacy_graphics = legacy_graphics };
+            |desktop_scale_factor: f64| {
+                let scale = if desktop_scale_factor == 0.0 {
+                    0
+                } else if desktop_scale_factor >= 100.0 && desktop_scale_factor <= 500.0 {
+                    #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    {
+                        desktop_scale_factor as u32
+                    }
+                } else {
+                    warn!(desktop_scale_factor, "Invalid desktop_scale_factor; fallback to 0 (server default)");
+                    0
+                };
+                self.0.borrow_mut().desktop_scale_factor = scale;
+            };
             |outbound_message_size_limit: f64| {
                 let limit = if outbound_message_size_limit >= 0.0 && outbound_message_size_limit <= f64::from(u32::MAX) {
                     #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -348,6 +370,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             render_canvas,
             set_cursor_style_callback,
             set_cursor_style_callback_context,
+            canvas_resized_callback,
             remote_clipboard_changed_callback,
             force_clipboard_update_callback,
             files_available_callback,
@@ -364,6 +387,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_driver_name,
             outbound_message_size_limit,
             legacy_graphics,
+            desktop_scale_factor,
         );
 
         {
@@ -391,6 +415,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
                 .set_cursor_style_callback_context
                 .clone()
                 .context("set_cursor_style_callback_context missing")?;
+            canvas_resized_callback = inner.canvas_resized_callback.clone();
             remote_clipboard_changed_callback = inner.remote_clipboard_changed_callback.clone();
             force_clipboard_update_callback = inner.force_clipboard_update_callback.clone();
             files_available_callback = inner.files_available_callback.clone();
@@ -407,6 +432,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_driver_name = inner.printer_driver_name.clone();
             outbound_message_size_limit = inner.outbound_message_size_limit;
             legacy_graphics = inner.legacy_graphics;
+            desktop_scale_factor = inner.desktop_scale_factor;
         }
 
         if pcb.is_some() && vmconnect.is_some() {
@@ -422,6 +448,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             client_name.clone(),
             desktop_size,
             legacy_graphics,
+            desktop_scale_factor,
         );
 
         let enable_credssp = self.0.borrow().enable_credssp;
@@ -516,6 +543,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_driver_name,
             computer_name: client_name.clone(),
             use_display_control,
+            input_events_tx: input_events_tx.clone(),
         })
         .await?;
 
@@ -536,6 +564,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             render_canvas,
             set_cursor_style_callback,
             set_cursor_style_callback_context,
+            canvas_resized_callback,
 
             input_events_rx: RefCell::new(Some(input_events_rx)),
             rdp_reader: RefCell::new(Some(rdp_reader)),
@@ -562,6 +591,13 @@ pub(crate) enum RdpInputEvent {
         scale_factor: Option<u32>,
         physical_size: Option<(u32, u32)>,
     },
+    /// Server resized the Graphics Output Buffer (MS-RDPEGFX 2.2.2.14). This is how a modern
+    /// Windows host answers a Display Control request: no Deactivation-Reactivation Sequence,
+    /// so it is the only chance we get to follow the new desktop size.
+    GraphicsReset {
+        width: u32,
+        height: u32,
+    },
     TerminateSession,
 }
 
@@ -584,6 +620,7 @@ pub(crate) struct Session {
     render_canvas: HtmlCanvasElement,
     set_cursor_style_callback: js_sys::Function,
     set_cursor_style_callback_context: JsValue,
+    canvas_resized_callback: Option<js_sys::Function>,
 
     // Consumed when `run` is called
     input_events_rx: RefCell<Option<mpsc::UnboundedReceiver<RdpInputEvent>>>,
@@ -682,8 +719,6 @@ impl iron_remote_desktop::Session for Session {
             connection_result.desktop_size.width,
             connection_result.desktop_size.height,
         );
-
-        let mut requested_resize = None;
 
         // Reused across frames so per-region extraction doesn't allocate on every draw.
         let mut draw_buffer = WriteBuf::new();
@@ -864,15 +899,22 @@ impl iron_remote_desktop::Session for Session {
                                 warn!("Resize event ignored: width or height is zero");
                                 Vec::new()
                             } else if let Some(response_frame) = active_stage.encode_resize(width, height, scale_factor, physical_size) {
-                                let width = NonZeroU32::new(width).expect("width is guaranteed to be non-zero due to the prior check");
-                                let height = NonZeroU32::new(height).expect("height is guaranteed to be non-zero due to the prior check");
-
-                                requested_resize = Some((width, height));
+                                // The canvas is not touched here: it follows whatever size the
+                                // server actually applies (EGFX ResetGraphics, or reactivation).
                                 vec![ActiveStageOutput::ResponseFrame(response_frame?)]
                             } else {
                                 debug!("Resize event ignored");
                                 Vec::new()
                             }
+                        },
+                        RdpInputEvent::GraphicsReset { width, height } => {
+                            // Image resize happens inside `ActiveStage::process` before same-frame
+                            // compositor deltas are applied. The canvas is synced from `image`
+                            // below. Do not SuppressOutput/RefreshRect here: with RDPGFX those
+                            // PDUs do not invalidate the surface cache (FreeRDP#12723) and can
+                            // leave the session waiting on a full paint that never arrives.
+                            debug!(width, height, "Graphics output buffer reset (image already follows)");
+                            Vec::new()
                         },
                         RdpInputEvent::Printer(message) => {
                             // The printer backend lives inside the Rdpdr SVC
@@ -914,6 +956,30 @@ impl iron_remote_desktop::Session for Session {
                     }
                 }
             };
+
+            // `process()` may have resized `image` to follow ResetGraphics in the same
+            // frame. The canvas has to match *before* the GraphicsUpdate from that frame
+            // is drawn, and because resize clears the backing store the preserved overlap
+            // must be put back — otherwise only the dirty tiles of this frame survive.
+            if let (Some(width), Some(height)) = (
+                NonZeroU32::new(u32::from(image.width())),
+                NonZeroU32::new(u32::from(image.height())),
+            ) && gui.resize(width, height)
+            {
+                let region = InclusiveRectangle {
+                    left: 0,
+                    top: 0,
+                    right: image.width().saturating_sub(1),
+                    bottom: image.height().saturating_sub(1),
+                };
+                let region = extract_partial_image(&image, region, &mut draw_buffer);
+                gui.draw(draw_buffer.filled_mut(), region)
+                    .context("repaint canvas after graphics reset")?;
+                draw_buffer.clear();
+                if let Some(callback) = &self.canvas_resized_callback {
+                    let _ = callback.call0(&JsValue::NULL);
+                }
+            }
 
             for out in outputs {
                 match out {
@@ -1041,13 +1107,6 @@ impl iron_remote_desktop::Session for Session {
                         // Execute the Deactivation-Reactivation Sequence:
                         // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
                         debug!("Received Server Deactivate All PDU, executing Deactivation-Reactivation Sequence");
-
-                        // We need to perform resize after receiving the Deactivate All PDU, because there may be frames
-                        // with the previous dimensions arriving between the resize request and this message.
-                        if let Some((width, height)) = requested_resize {
-                            gui.resize(width, height);
-                            requested_resize = None;
-                        }
 
                         let mut connection_activation = activation_factory.create();
                         let mut buf = WriteBuf::new();
@@ -1459,6 +1518,7 @@ fn build_config(
     client_name: String,
     desktop_size: DesktopSize,
     legacy_graphics: bool,
+    desktop_scale_factor: u32,
 ) -> connector::Config {
     // Win7-class servers need 32-bpp lossless bitmaps and no advertised codecs.
     let bitmap = if legacy_graphics {
@@ -1516,9 +1576,11 @@ fn build_config(
         request_data: None,
         pointer_software_rendering: false,
         multitransport_flags: None,
-        support_dyn_vc_gfx_protocol: false,
+        // Prefer MS-RDPEGFX when the server supports it — classic bitmap updates
+        // paint dirty rectangles and look "blocky" on full refreshes.
+        support_dyn_vc_gfx_protocol: true,
         performance_flags: PerformanceFlags::default(),
-        desktop_scale_factor: 0,
+        desktop_scale_factor,
         hardware_id: None,
         license_cache: None,
         timezone_info: TimezoneInfo::default(),
@@ -1584,6 +1646,8 @@ struct ConnectParams {
     /// `computer_name` when constructing the `Rdpdr` processor.
     computer_name: String,
     use_display_control: bool,
+    /// Lets the EGFX handler report server-driven desktop resizes to the event loop.
+    input_events_tx: mpsc::UnboundedSender<RdpInputEvent>,
 }
 
 fn default_printer_driver_name() -> String {
@@ -1634,6 +1698,7 @@ async fn connect(
         printer_driver_name,
         computer_name,
         use_display_control,
+        input_events_tx,
     }: ConnectParams,
 ) -> Result<(connector::ConnectionResult, WebSocket), IronError> {
     let mut framed = ironrdp_futures::LocalFuturesFramed::new(ws);
@@ -1661,11 +1726,42 @@ async fn connect(
         );
     }
 
-    if use_display_control {
-        connector.attach_static_channel(
-            DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new()))),
-        );
+    // Advertise SUPPORT_DYN_VC_GFX in Config, and actually register the EGFX
+    // DVC here. Without GraphicsPipelineClient the server stays on classic
+    // dirty-rectangle bitmaps (blocky full-screen refreshes).
+    //
+    // No H.264 decoder in WASM yet — GraphicsPipelineClient filters AVC caps
+    // and falls back to V8 / ClearCodec / RFX Progressive.
+    struct EgfxHandler {
+        input_events_tx: mpsc::UnboundedSender<RdpInputEvent>,
     }
+    impl GraphicsPipelineHandler for EgfxHandler {
+        fn on_reset_graphics(&mut self, width: u32, height: u32) {
+            // The decoded image and the canvas backing store are both sized from the desktop and
+            // are not touched by the EGFX pipeline. Left alone, everything outside the new desktop
+            // keeps the pixels of the old one forever (visible as a hard seam).
+            if self
+                .input_events_tx
+                .unbounded_send(RdpInputEvent::GraphicsReset { width, height })
+                .is_err()
+            {
+                warn!("Failed to send graphics reset event, receiver is closed");
+            }
+        }
+    }
+
+    let mut drdynvc = DrdynvcClient::new().with_dynamic_channel(GraphicsPipelineClient::new(
+        Box::new(EgfxHandler {
+            input_events_tx: input_events_tx.clone(),
+        }),
+        None,
+    ));
+    if use_display_control {
+        // Caps 到达后不自动 MonitorLayout：连上立刻 resize 会清空 canvas，
+        // 再叠加 GFX progressive 容易整屏黑块。尺寸改动留给前端在用户拖窗口时调用。
+        drdynvc = drdynvc.with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
+    }
+    connector.attach_static_channel(drdynvc);
 
     let kerberos_config = url::Url::parse(kdc_proxy_url.unwrap_or_default().as_str())
         .ok()
