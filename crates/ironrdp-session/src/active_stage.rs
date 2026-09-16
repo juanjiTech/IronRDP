@@ -223,6 +223,20 @@ impl ActiveStage {
                 // data only ever arrives over a DVC, which is X224-carried, so this stays
                 // out of the Action::FastPath arm rather than running on every fast-path
                 // frame (the highest-frequency path in a session).
+                let reset = self
+                    .get_dvc_mut::<GraphicsPipelineClient>()
+                    .and_then(|mut gfx| gfx.processor_mut().take_reset_graphics());
+                // The image must follow the new output *before* the deltas that arrived in the
+                // same payload are applied: they are already in the compositor, and the server
+                // will not send them again.
+                if let Some((w, h)) = reset
+                    && w > 0
+                    && h > 0
+                    && (image.width() != w || image.height() != h)
+                {
+                    debug!(w, h, "EGFX output resized");
+                    *image = DecodedImage::new(image.pixel_format(), w, h);
+                }
                 let graphics_updates = self
                     .get_dvc_mut::<GraphicsPipelineClient>()
                     .map(|mut gfx| gfx.processor_mut().drain_output())

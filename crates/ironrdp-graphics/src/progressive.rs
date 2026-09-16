@@ -1218,6 +1218,17 @@ impl core::fmt::Display for ProgressiveDecodeError {
     }
 }
 
+impl core::error::Error for ProgressiveDecodeError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Pdu(e) => Some(e),
+            Self::Rlgr(e) => Some(e),
+            Self::Srl(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
 impl From<ironrdp_core::DecodeError> for ProgressiveDecodeError {
     fn from(e: ironrdp_core::DecodeError) -> Self {
         Self::Pdu(e)
@@ -1545,6 +1556,30 @@ impl ProgressiveDecoder {
         self.frame_tiles
             .retain(|(context_surface_id, _), _| *context_surface_id != surface_id);
         self.surface_context_flags.remove(&surface_id);
+    }
+
+    /// Number of retained difference-tile coefficient buffers for a surface.
+    #[must_use]
+    pub fn reference_count_for_surface(&self, surface_id: u16) -> usize {
+        self.references
+            .keys()
+            .filter(|(reference_surface_id, _, _)| *reference_surface_id == surface_id)
+            .count()
+    }
+
+    /// Total retained difference-tile coefficient buffers across all surfaces.
+    #[must_use]
+    pub fn total_reference_count(&self) -> usize {
+        self.references.len()
+    }
+
+    /// Drop every surface's difference-tile coefficient buffers.
+    ///
+    /// `ResetGraphics` implicitly destroys all surfaces (MS-RDPEGFX 2.2.2.14)
+    /// but does not re-negotiate progressive CONTEXT. Tile references belong
+    /// to the destroyed surfaces; CONTEXT does not.
+    pub fn clear_tile_references(&mut self) {
+        self.references.clear();
     }
 
     /// Reset codec-context state while retaining surface sub-band references.
@@ -2075,7 +2110,7 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_pass_rejects_truncated_srl() {
+    fn upgrade_pass_completes_when_the_srl_stream_ends_early() {
         let mut coefficients = [0i16; COEFFICIENTS_PER_COMPONENT];
         let mut sign = [SIGN_POSITIVE; COEFFICIENTS_PER_COMPONENT];
         sign[0] = SIGN_ZERO;
@@ -2083,6 +2118,8 @@ mod tests {
         let mut prev_prog_quant = ComponentCodecQuant::LOSSLESS;
         prev_prog_quant.hl1 = 4;
 
+        // Windows 停笔在剩余系数全为零处，SRL 流因此短于本 band 的系数个数。
+        // 以前这会让整块更新被丢掉，画面上就是一直不刷新的方块。
         assert_eq!(
             decode_upgrade_pass(
                 &[0x80, 0x00],
@@ -2093,7 +2130,7 @@ mod tests {
                 &mut coefficients,
                 &mut sign,
             ),
-            Err(SrlError::Truncated)
+            Ok(())
         );
     }
 
@@ -2102,28 +2139,38 @@ mod tests {
         let mut tile = TileState::new();
         let mut prev_prog_quant = ComponentCodecQuant::LOSSLESS;
         prev_prog_quant.hl1 = 4;
-        tile.prog_quant = [prev_prog_quant; 3];
+
+        // 第三个分量的量化位宽越界，于是它的幅值解码必然失败。线路上的 quant 是 4 bit
+        // nibble（见 ComponentCodecQuant::decode），到不了 16；这里走结构体字面量，和
+        // rfx.rs 里那几个 `quant_validate` 测试同一个理由：字面量构造的值得在用之前挡住。
+        let mut out_of_range_quant = ComponentCodecQuant::LOSSLESS;
+        out_of_range_quant.hl1 = 20;
+
+        tile.prog_quant = [prev_prog_quant, prev_prog_quant, out_of_range_quant];
         tile.pass = 1;
         tile.quality = 50;
+        // 每个分量在 HL1 里留一个 SRL 条目，前两个分量因此会先解码成功。
         tile.sign[0][0] = SIGN_ZERO;
         tile.sign[1][0] = SIGN_ZERO;
+        tile.sign[2][0] = SIGN_ZERO;
 
         let coefficients = tile.coefficients;
         let sign = tile.sign;
+        let prog_quant = tile.prog_quant;
 
         assert_eq!(
             tile.decode_upgrade(
-                [&[0x90, 0x00], &[0x80, 0x00], &[]],
+                [&[0x90, 0x00], &[0x80, 0x00], &[0x90, 0x00]],
                 [&[], &[], &[]],
                 [ComponentCodecQuant::LOSSLESS; 3],
                 75,
             ),
-            Err(SrlError::Truncated)
+            Err(SrlError::InvalidBitCount(20))
         );
 
         assert_eq!(tile.coefficients, coefficients);
         assert_eq!(tile.sign, sign);
-        assert_eq!(tile.prog_quant, [prev_prog_quant; 3]);
+        assert_eq!(tile.prog_quant, prog_quant);
         assert_eq!(tile.pass, 1);
         assert_eq!(tile.quality, 50);
     }

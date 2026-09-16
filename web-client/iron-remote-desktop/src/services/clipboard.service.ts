@@ -91,33 +91,36 @@ export class ClipboardService {
         //    - 'denied': Downgrade to TextOnly; the polling loop would
         //      fail on every iteration.
         //
-        // 2. Firefox v127+: Exposes clipboard.read()/write() but does not
-        //    include "clipboard-read" in its PermissionName WebIDL enum, so
-        //    the query throws. Without persistent permission, Firefox requires
-        //    transient user activation for every clipboard.read() call, making
-        //    the polling loop unusable. Downgrade to TextOnly so Firefox
-        //    routes through the text-only fallback paths.
+        // 2. Firefox / WKWebView: Exposes clipboard.read()/write() but does not
+        //    include "clipboard-read" in PermissionName, so the query throws.
+        //    Without persistent permission, every clipboard.read() needs user
+        //    activation — and on macOS WKWebView it also pops a system Paste
+        //    banner. Downgrade to TextOnly; do NOT probe with clipboard.read()
+        //    (that alone re-triggers Paste on every component remount, e.g.
+        //    Termium silent resize-reconnect).
         //
-        //    When the permission query fails, a trial clipboard.read() checks
-        //    whether Firefox's `dom.events.testing.asyncClipboard` about:config
-        //    pref is active. If so, keep Full mode as clipboard works fully in
-        //    this scenario, without any user-activation restrictions.
-        if (this.ClipboardApiSupported === ClipboardApiSupported.Full) {
+        // When autoClipboard is already off (Termium sets it between ready and
+        // this init), skip the Permissions API entirely — no polling to gate,
+        // and some WKWebView builds have been observed to stall on query.
+        if (
+            this.ClipboardApiSupported === ClipboardApiSupported.Full &&
+            this.remoteDesktopService.autoClipboard
+        ) {
             try {
-                const permissionStatus = await navigator.permissions.query({
-                    name: 'clipboard-read' as PermissionName,
-                });
+                const permissionStatus = await Promise.race([
+                    navigator.permissions.query({
+                        name: 'clipboard-read' as PermissionName,
+                    }),
+                    new Promise<never>((_, reject) => {
+                        setTimeout(() => reject(new Error('clipboard-read permission query timeout')), 250);
+                    }),
+                ]);
 
                 if (permissionStatus.state === 'denied') {
                     this.ClipboardApiSupported = ClipboardApiSupported.TextOnly;
                 }
             } catch {
-                try {
-                    // Try to read clipboard to check if the asyncClipboard pref is enabled
-                    await navigator.clipboard.read();
-                } catch {
-                    this.ClipboardApiSupported = ClipboardApiSupported.TextOnly;
-                }
+                this.ClipboardApiSupported = ClipboardApiSupported.TextOnly;
             }
         }
 
