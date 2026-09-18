@@ -1,6 +1,6 @@
 # Pull request automation
 
-`.github/workflows/labeler.yml` classifies ready, open pull requests and calls `.github/workflows/review-pipeline.yml` for at most two automated reviews.
+`.github/workflows/pr-automation.yml` classifies ready, open pull requests and calls `.github/workflows/review-pipeline.yml` for at most two automated reviews.
 Automatic review stops at `ai-reviewed/2` unless a maintainer uses force mode; classification keeps running.
 Manual `workflow_dispatch` requests and forced reviews require a successful GitHub Actions-owned `AI classification` check for the current head with valid machine state.
 They fail visibly before any reviewer starts when that prerequisite is missing, stale, or invalid; automatic CI and classification-complete races instead skip normally.
@@ -16,7 +16,7 @@ The classifier and all reviewers use `glm5.3`.
 The pipeline performs these stages:
 
 1. Prepare a SHA-bound changed-file manifest, diff, pull request context, and read-only head tree.
-2. Classify risk, scope, legitimacy, duplicate likelihood, protocol relevance, and useful specialist reviewers.
+2. Classify risk, scope, legitimacy, overlap with another pull request, protocol relevance, and useful specialist reviewers.
 3. Apply workflow-controlled routing rules and persist the canonical review plan in the `AI classification` check.
 4. Run selected specialists as parallel matrix jobs, at most three at once.
 5. Validate each specialist result, then aggregate the results in the canonical order `protocol`, `skeptical`, `code-compressor`.
@@ -46,6 +46,7 @@ Protocol candidates also carry structured protocol references.
 One specialist never receives another specialist's output.
 
 The general reviewer independently inspects the pull request, attempts to falsify every candidate, and records exactly one `accepted`, `refined`, or `rejected` disposition per candidate.
+A candidate is one entry in the findings of a reviewer the aggregate reports as valid, so a reviewer that failed or reported nothing contributes none.
 It can merge overlapping candidates and add findings that no specialist reported.
 Only the validated general-review result can be published.
 
@@ -59,6 +60,8 @@ The validator reads the changed-file manifest, the protocol corpus, and the spec
 
 The validator distinguishes two outcomes.
 A wrong head SHA, an unchanged path, a malformed line range, an unverifiable protocol citation, or a missing candidate disposition is correctable, so the runtime repairs the output inside the same conversation, at most twice.
+Final-review rejections describe validation failures without quoting model text.
+Disposition-map errors are reported together, so repairs do not have to discover missing candidates one at a time.
 A stale or unavailable trusted input is not correctable, so the stage fails immediately instead of burning repair attempts.
 Repair may correct a finding but may never drop one, and a stage fails when it cannot produce valid output.
 
@@ -196,8 +199,14 @@ Other human authors need one qualifying merged IronRDP pull request from the sam
 A qualifying pull request is any pull request from that author merged into `master`.
 Automatic review requires successful CI for the exact classified head.
 After the first review, a later push starts the second review when CI succeeds for that new head.
-Duplicates at confidence 0.85 or greater, legitimacy triage, and `ai-reviewed/2` block automatic review.
+Legitimacy triage and `ai-reviewed/2` block automatic review.
+A suspected overlap with another pull request is advisory: at confidence 0.85 or greater it adds `triage/overlap` and a non-blocking comment, and review proceeds under the usual gates.
+The classifier reports possible shared scope in `overlap`, using candidate titles and truncated bodies.
 Unavailable or invalid classification fails closed to maintainer review.
+
+`maintainer-required` marks a pull request whose next step belongs to a maintainer.
+A review applies it when it reports no findings and withdraws it when it reports findings.
+Once `ai-reviewed/2` is set, classification applies it on the next push, because automatic review has stopped.
 
 Bot-authored pull requests do not run automatic routes or label reconciliation.
 Force mode can override policy gates for an open pull request at its current head after a trusted, valid classification for that exact head selects its reviewers.
@@ -231,6 +240,7 @@ SHA-bound GitHub checks carry classification and review state between permission
 Attempt-scoped workflow artifacts carry evidence and validated results between review-pipeline jobs and across recovery attempts.
 Only the final writer mutates pull request state, and it serializes those mutations per pull request.
 Model-execution jobs have read-only or empty permissions.
+The run summary links the pull request the run resolved.
 
 Four static classifier lanes allow at most four classifier jobs to invoke Helmcode at once.
 Seven static caller-job lanes lock each reusable review pipeline from evidence through its result.
